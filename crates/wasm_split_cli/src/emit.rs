@@ -9,7 +9,7 @@ use crate::{
     magic_constants,
     read::{InputFuncId, InputModule, InputOffset},
     reloc::{RelocDetails, RelocInfo, RelocTarget},
-    split_point::{SplitModuleIdentifier, SplitProgramInfo},
+    split_point::{OutputModuleInfo, SplitModuleIdentifier, SplitProgramInfo},
     util::{wasm_data_len, wasm_data_start},
 };
 use eyre::{bail, Context, Result};
@@ -30,6 +30,8 @@ pub(crate) struct EmitState<'a> {
     shared_names: HashMap<DepNode, Cow<'a, str>>,
     no_reloc_stubs: &'a HashSet<InputFuncId>,
     canary_import_name: &'a str,
+    // per output module: instantiating it would define nothing
+    empty_modules: Vec<bool>,
 }
 
 impl<'a> EmitState<'a> {
@@ -42,6 +44,23 @@ impl<'a> EmitState<'a> {
     ) -> Result<Self> {
         let indirect_functions = IndirectFunctionEmitInfo::new(module, program_info)?;
         let data_relocations = DataEmitInfo::new(module, program_info)?;
+
+        // The split analysis assigns every symbol a module, including data symbols that
+        // emit no bytes: zero-sized, or moved into the main module with an overlong
+        // segment. A module with only such members would be a file holding nothing but
+        // the type table and empty data segments, fetched by every split in its set.
+        // A declared split module without symbols stays empty even when a passive or TLS
+        // segment, which every module copies, would count as data for it.
+        let empty_modules = program_info
+            .output_modules
+            .iter()
+            .enumerate()
+            .map(|(module_index, (identifier, info))| {
+                !matches!(identifier, SplitModuleIdentifier::Main)
+                    && (info.is_empty
+                        || !module_defines_anything(module, info, &data_relocations, module_index))
+            })
+            .collect();
 
         let mut shared_names = HashMap::new();
         // We potentially overwrite the mapping later on again, but that's okay.
@@ -94,7 +113,15 @@ impl<'a> EmitState<'a> {
             shared_names,
             no_reloc_stubs,
             canary_import_name: program_info.canary_export_name(),
+            empty_modules,
         })
+    }
+
+    /// True when instantiating the module would define nothing. No file is emitted for
+    /// it; a split module's loader then resolves without a fetch, and a chunk gets no
+    /// loader at all.
+    pub(crate) fn module_is_empty(&self, output_module_index: usize) -> bool {
+        self.empty_modules[output_module_index]
     }
 
     pub(crate) fn input(&self) -> &'a InputModule<'a> {
@@ -585,6 +612,39 @@ impl DataEmitInfo {
         address += offset_in_range;
         Ok(Some(address))
     }
+
+    /// Whether the output module receives any data bytes from any segment. Passive and
+    /// TLS segments are copied into every module, so a non-empty one counts for all.
+    fn emits_data_in(&self, input_module: &InputModule, output_module_index: usize) -> bool {
+        self.per_segment
+            .iter()
+            .zip(&input_module.data_segments)
+            .any(|(emit_info, segment)| match emit_info {
+                DataSegmentEmitInfo::FromInputInAll => wasm_data_len(segment) > 0,
+                DataSegmentEmitInfo::FromInputOnlyIn(module) => {
+                    *module == output_module_index && wasm_data_len(segment) > 0
+                }
+                DataSegmentEmitInfo::Ranges {
+                    per_output_offset, ..
+                } => per_output_offset.contains_key(&output_module_index),
+            })
+    }
+}
+
+/// Whether instantiating the output module defines a function or any data bytes. Nothing
+/// else decides: tables, memories and globals are defined by the main module only, and the
+/// shims a module emits for shared functions are dead without a function of its own.
+fn module_defines_anything(
+    input_module: &InputModule,
+    info: &OutputModuleInfo,
+    data: &DataEmitInfo,
+    output_module_index: usize,
+) -> bool {
+    let defines_function = info.included_symbols.iter().any(|dep| match dep {
+        DepNode::Function(id) => *id >= input_module.imported_funcs.len(),
+        _ => false,
+    });
+    defines_function || data.emits_data_in(input_module, output_module_index)
 }
 
 #[derive(Debug, Clone)]
@@ -1619,8 +1679,8 @@ pub fn emit_modules<'info, M>(
 ) -> Result<Vec<M>> {
     let modules = program_info.output_modules.iter().enumerate();
     modules
-        .map(|(output_module_index, (identifier, module))| {
-            if module.is_empty {
+        .map(|(output_module_index, (identifier, _))| {
+            if emit_state.module_is_empty(output_module_index) {
                 return Ok(None);
             }
             let mut emit_state =

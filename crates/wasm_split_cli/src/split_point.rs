@@ -106,6 +106,9 @@ pub struct ReachabilityGraph {
 pub struct OutputModuleInfo {
     pub included_symbols: HashSet<DepNode>,
     pub used_shared_deps: HashSet<DepNode>,
+    /// A split module declared in the code that was painted no symbols. The emitter folds
+    /// this into `EmitState::module_is_empty`, which also covers modules whose members
+    /// emit no bytes.
     pub is_empty: bool,
 }
 

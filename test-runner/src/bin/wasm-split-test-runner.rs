@@ -2,7 +2,7 @@ use eyre::{Result, ensure};
 use serde::Serialize;
 use sha2::Digest;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env::args_os,
     path::{Path, PathBuf},
     process::Command,
@@ -97,6 +97,54 @@ fn collect_file_sizes(
     Ok(())
 }
 
+/// Every emitted module must define something and be reachable through a loader: the CLI
+/// skips modules that would define nothing, and a file missing from the prefetch map has
+/// no loader that could fetch it.
+fn check_emitted_modules(split: &wasm_split_cli_support::SplitWasm) -> Result<()> {
+    let prefetched: HashSet<&str> = split
+        .prefetch_map
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    for module in &split.split_modules {
+        let stem = module
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| eyre::eyre!("module path without a file stem: {}", module.display()))?;
+        ensure!(
+            prefetched.contains(stem),
+            "emitted module {} has no loader in the prefetch map",
+            module.display()
+        );
+        ensure!(
+            module_defines_something(&std::fs::read(module)?)?,
+            "emitted module {} defines no function and no data; it should have been skipped",
+            module.display()
+        );
+    }
+    Ok(())
+}
+
+fn module_defines_something(bytes: &[u8]) -> Result<bool> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            wasmparser::Payload::FunctionSection(functions) if functions.count() > 0 => {
+                return Ok(true);
+            }
+            wasmparser::Payload::DataSection(segments) => {
+                for segment in segments {
+                    if !segment?.data.is_empty() {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 fn check_reproducible(first_report: &Report, second_report: &Report) -> Result<()> {
     ensure!(
         first_report.file_hashes == second_report.file_hashes,
@@ -129,6 +177,7 @@ fn wasm_split_cli(target: &Path, dir: &Path) -> Result<(PathBuf, Report)> {
     report.cli_runtime = time_taken;
 
     collect_file_sizes(&mut report, &main_file, &split)?;
+    check_emitted_modules(&split)?;
 
     Ok((main_file, report))
 }

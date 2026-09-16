@@ -5,6 +5,7 @@
 members = [
     "simple",
     "many_shares",
+    "sparse_shares",
     "callback-in-split",
     "optimize_splits",
     "static_mut",
