@@ -26,7 +26,8 @@ use tracing_support::perf_span;
 pub struct SplitWasm {
     pub split_modules: Vec<PathBuf>,
     /// split -> dependency filestem
-    /// e.g. `{ "foo": ["chunk_0", "foo"] }`
+    /// e.g. `{ "foo": ["chunk_2", "foo"] }`
+    /// Modules that would define nothing get no file and do not appear here.
     pub prefetch_map: HashMap<String, Vec<String>>,
 }
 
